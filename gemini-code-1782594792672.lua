@@ -1,5 +1,5 @@
 -- =============================================
---  AUTO FARM GUI v4 — SUNSHINE + DARK MATTER
+--  AUTO FARM GUI v5 — SUNSHINE + DARK MATTER
 --  Supports both bossRaids and invasions
 -- =============================================
 
@@ -8,6 +8,7 @@ local RunService        = game:GetService("RunService")
 local UIS               = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace         = game:GetService("Workspace")
+local HttpService       = game:GetService("HttpService")
 
 local player = Players.LocalPlayer
 local pgui   = player:WaitForChild("PlayerGui", 10)
@@ -81,20 +82,20 @@ local RaidList = {
     },
 }
 
+local ModifierOptions = {
+    "Disabled",
+    "Boss Killer",
+    "Overflowing Wealth",
+    "Espionage",
+    "Reinforcement",
+    "Momentum",
+}
+
 -- =============================================
 --  STATE
 -- =============================================
 
 getgenv().AFState = {
-    webhookUrl           = "",       -- ADD YOUR WEBHOOK URL HERE
-    sendWebhook          = true,     -- SET TO TRUE TO ENABLE WEBHOOK NOTIFICATIONS
-    modifierPriority     = {         -- 1 IS HIGHEST PRIORITY. ADD EXACT CARD NAMES HERE:
-        "Boss Killer",
-        "Overflowing Wealth",
-        "Espionage",
-        "Reinforcement",
-        "Momentum"
-    },
     autoEquipWeapon      = false,
     autoUseWeapon        = false,
     autoClaimAchievement = false,
@@ -106,37 +107,23 @@ getgenv().AFState = {
     running              = true,
     inRaid               = false,
     selectedRaid         = RaidList[1],
+    webhookEnabled       = false,
+    webhookUrl           = "",
+    webhookRewards       = true,
+    replayGraceUntil     = 0,
+    modifierPriorities   = {
+        "Boss Killer",
+        "Overflowing Wealth",
+        "Espionage",
+        "Reinforcement",
+        "Momentum",
+    },
 }
 local State = getgenv().AFState
 
 -- =============================================
 --  HELPERS
 -- =============================================
-
-local function sendWebhookLog(raidName)
-    if State.webhookUrl == "" or not State.sendWebhook then return end
-    local http_request = (syn and syn.request) or (http and http.request) or http_request or (fluxus and fluxus.request) or request
-    if not http_request then return end
-
-    local data = {
-        content = "",
-        embeds = {
-            {
-                title = "🎉 Raid Completed!",
-                description = "Successfully finished: **" .. tostring(raidName) .. "**\n*(Rewards claimed automatically)*",
-                color = 5814783
-            }
-        }
-    }
-    pcall(function()
-        http_request({
-            Url = State.webhookUrl,
-            Method = "POST",
-            Headers = {["Content-Type"] = "application/json"},
-            Body = game:GetService("HttpService"):JSONEncode(data)
-        })
-    end)
-end
 
 local RAID_Y_MIN = 5000
 
@@ -173,6 +160,89 @@ local function isInRaidArea()
     if not hrp then return false end
     return hrp.Position.Y > RAID_Y_MIN
 end
+
+local function trimText(v)
+    v = tostring(v or "")
+    return (v:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+local function normalizeText(v)
+    return string.lower(trimText(v):gsub("%s+", " "))
+end
+
+local function getRequestFunction()
+    return (syn and syn.request) or http_request or request or (http and http.request)
+end
+
+local function collectVisibleText(keywords)
+    local lines = {}
+    local seen = {}
+    for _, obj in ipairs(pgui:GetDescendants()) do
+        if (obj:IsA("TextLabel") or obj:IsA("TextButton")) and obj.Visible then
+            if obj:IsDescendantOf(pgui:FindFirstChild("AutoFarmGUI")) then continue end
+            local text = trimText(obj.Text)
+            if text ~= "" then
+                local low = string.lower(text)
+                local keep = not keywords
+                if keywords then
+                    for _, kw in ipairs(keywords) do
+                        if string.find(low, kw, 1, true) then keep = true; break end
+                    end
+                end
+                if keep and not seen[text] then
+                    seen[text] = true
+                    table.insert(lines, text)
+                end
+            end
+        end
+    end
+    return lines
+end
+
+local function getVictoryRewards()
+    local lines = collectVisibleText({"reward", "gem", "coin", "yen", "xp", "token", "trait", "item", "drop", "essence", "shard", "gold"})
+    if #lines == 0 then return "Rewards not detected from UI" end
+    return table.concat(lines, "\n")
+end
+
+local function sendWebhook(title, description, color)
+    if not State.webhookEnabled then return end
+    local url = trimText(State.webhookUrl)
+    if url == "" then return end
+    local req = getRequestFunction()
+    if not req then
+        warn("[AF] No HTTP request function found for webhook")
+        return
+    end
+
+    local payload = {
+        username = "Auto Farm GUI",
+        embeds = {{
+            title = title,
+            description = description,
+            color = color or 5763719,
+            fields = {
+                { name = "Raid", value = State.selectedRaid and State.selectedRaid.display or "Unknown", inline = true },
+                { name = "Player", value = player.Name, inline = true },
+            },
+            footer = { text = "Auto Farm v5" },
+            timestamp = DateTime.now():ToIsoDate(),
+        }}
+    }
+
+    task.spawn(function()
+        local ok, err = pcall(function()
+            req({
+                Url = url,
+                Method = "POST",
+                Headers = { ["Content-Type"] = "application/json" },
+                Body = HttpService:JSONEncode(payload),
+            })
+        end)
+        if not ok then warn("[AF] Webhook failed: " .. tostring(err)) end
+    end)
+end
+
 
 -- =============================================
 --  UNIVERSAL ENEMY DETECTION
@@ -503,48 +573,74 @@ end
 --  AUTO CARD VOTING (Invasions only)
 -- =============================================
 
-local function autoVoteCard()
-    if not R.voteCard then return end
-    
-    local bestCardObj = nil
-    local bestPriority = 9999
+local function clickCardFromLabel(label)
+    local current = label.Parent
+    for d = 1, 10 do
+        if not current or current == pgui then break end
+        if current.Name == "inner" then
+            local tb = current:FindFirstChildOfClass("TextButton")
+            if tb then
+                pcall(function()
+                    for _, conn in pairs(getconnections(tb.Activated)) do
+                        conn:Fire()
+                    end
+                end)
+                return true
+            end
+            break
+        end
+        current = current.Parent
+    end
+    return false
+end
 
+local function getVisibleModifierCards()
+    local cards = {}
+    local seen = {}
     for _, obj in ipairs(pgui:GetDescendants()) do
         if obj:IsA("TextLabel") and obj.Visible then
             if obj:IsDescendantOf(pgui:FindFirstChild("AutoFarmGUI")) then continue end
-            local t = obj.Text
+            local text = trimText(obj.Text)
+            if text ~= "" and #text <= 45 and not seen[text] then
+                local low = normalizeText(text)
+                for _, opt in ipairs(ModifierOptions) do
+                    if opt ~= "Disabled" and string.find(low, normalizeText(opt), 1, true) then
+                        seen[text] = true
+                        table.insert(cards, { label = obj, title = text, key = low })
+                        break
+                    end
+                end
+            end
+        end
+    end
+    return cards
+end
 
-            for i, modName in ipairs(State.modifierPriority) do
-                if string.find(string.lower(t), string.lower(modName), 1, true) then
-                    if i < bestPriority then
-                        bestPriority = i
-                        bestCardObj = obj
+local function autoVoteCard()
+    if not R.voteCard then return end
+    local cards = getVisibleModifierCards()
+    if #cards == 0 then return false end
+
+    for _, wanted in ipairs(State.modifierPriorities or {}) do
+        wanted = trimText(wanted)
+        if wanted ~= "" and wanted ~= "Disabled" then
+            local wantedKey = normalizeText(wanted)
+            for _, card in ipairs(cards) do
+                if string.find(card.key, wantedKey, 1, true) or string.find(wantedKey, card.key, 1, true) then
+                    if clickCardFromLabel(card.label) then
+                        print("[AF] Voted priority modifier: " .. card.title)
+                        sendWebhook("Modifier picked", "Picked **" .. card.title .. "** from priority list.", 3447003)
+                        return true
                     end
                 end
             end
         end
     end
 
-    if bestCardObj then
-        -- Click the highest priority card
-        local current = bestCardObj.Parent
-        for d = 1, 10 do
-            if not current or current == pgui then break end
-            if current.Name == "inner" then
-                local tb = current:FindFirstChildOfClass("TextButton")
-                if tb then
-                    pcall(function()
-                        for _, conn in pairs(getconnections(tb.Activated)) do
-                            conn:Fire()
-                        end
-                    end)
-                    print("[AF] Voted for priority " .. bestPriority .. " card: " .. bestCardObj.Text)
-                    return true
-                end
-                break
-            end
-            current = current.Parent
-        end
+    if clickCardFromLabel(cards[1].label) then
+        print("[AF] Voted fallback modifier: " .. cards[1].title)
+        sendWebhook("Modifier picked", "Picked fallback **" .. cards[1].title .. "** because no priority cards were visible.", 15105570)
+        return true
     end
     return false
 end
@@ -604,13 +700,8 @@ local function raidCycleLoop()
         if not State.autoFarm or not State.autoCreateRaid then continue end
         if not State.selectedRaid.working then continue end
 
-        -- Prevent lobby teleport if we started the script while already inside the raid
-        if isInRaidArea() and not State.inRaid then
-            State.inRaid = true
-            print("[AF] Script started inside raid. Teleport to bald hero prevented.")
-        end
-
-        if not isInRaidArea() and not State.inRaid then
+        local waitingForInvasionReplay = State.selectedRaid.raidType == "invasion" and tick() < (State.replayGraceUntil or 0)
+        if not isInRaidArea() and not State.inRaid and not waitingForInvasionReplay then
             local enemies = getAliveEnemies()
             if #enemies == 0 then
                 local raid = State.selectedRaid
@@ -792,7 +883,7 @@ local function victoryLoop()
             task.wait(3)
 
             local raid = State.selectedRaid
-            sendWebhookLog(raid.display)
+            local rewardText = State.webhookRewards and getVictoryRewards() or "Completed."
 
             if raid.raidType == "invasion" then
                 -- INVASION: Click Replay to restart immediately
@@ -811,10 +902,12 @@ local function victoryLoop()
                     replayInvasion()
                 end
 
+                State.inRaid = true
+                State.replayGraceUntil = tick() + 90
+                sendWebhook("Invasion finished", rewardText, 5763719)
                 task.wait(3)
-                -- After replay we stay in raid area (new instance)
-                -- Don't set inRaid = false, just keep farming
-                print("[AF] Replay invasion processing, continuing farm!")
+                -- After replay we stay in raid flow; the game teleports us into the next run.
+                print("[AF] Replaying invasion, continuing farm!")
 
             else
                 -- BOSS RAID: Click Continue then leaveRaid
@@ -831,6 +924,7 @@ local function victoryLoop()
                     end
                 end
 
+                sendWebhook("Raid finished", rewardText, 5763719)
                 task.wait(2)
                 State.inRaid = false
                 -- raidCycleLoop will handle re-creating
@@ -839,8 +933,12 @@ local function victoryLoop()
 
         -- Backup: detect teleport back to lobby
         if State.inRaid and not isInRaidArea() then
-            print("[AF] Returned to lobby (teleport detected)")
-            State.inRaid = false
+            if State.selectedRaid.raidType == "invasion" and tick() < (State.replayGraceUntil or 0) then
+                print("[AF] Invasion replay transition detected; staying in raid mode")
+            else
+                print("[AF] Returned to lobby (teleport detected)")
+                State.inRaid = false
+            end
         end
     end
 end
@@ -916,3 +1014,413 @@ floatBtn.InputBegan:Connect(function(i)
     if i.UserInputType == Enum.UserInputType.Touch or i.UserInputType == Enum.UserInputType.MouseButton1 then
         fDrag.on=true; fDrag.s=i.Position; fDrag.p=floatBtn.Position
         i.Changed:Connect(function()
+            if i.UserInputState == Enum.UserInputState.End and fDrag.on then
+                local d = i.Position - fDrag.s
+                if math.abs(d.X)+math.abs(d.Y) < 10 then
+                    State.guiVisible = not State.guiVisible
+                    mainFrame.Visible = State.guiVisible
+                    if State.guiVisible then
+                        floatBtn.BackgroundColor3 = C.accent1
+                        floatIcon.Text = "AF"
+                    else
+                        floatBtn.BackgroundColor3 = C.accent3
+                        floatIcon.Text = "AF"
+                    end
+                end
+                fDrag.on = false
+            end
+        end)
+    end
+end)
+UIS.InputChanged:Connect(function(i)
+    if fDrag.on and (i.UserInputType == Enum.UserInputType.Touch or i.UserInputType == Enum.UserInputType.MouseMovement) then
+        local d = i.Position - fDrag.s
+        floatBtn.Position = UDim2.new(fDrag.p.X.Scale, fDrag.p.X.Offset+d.X, fDrag.p.Y.Scale, fDrag.p.Y.Offset+d.Y)
+    end
+end)
+
+-- =============================================
+--  MAIN FRAME
+-- =============================================
+
+mainFrame = Instance.new("Frame", sg)
+mainFrame.Name = "Main"; mainFrame.Size = UDim2.new(0, 260, 0, 460)
+mainFrame.Position = UDim2.new(0.5, -130, 0.5, -230)
+mainFrame.BackgroundColor3 = C.bg; mainFrame.BorderSizePixel = 0
+mainFrame.Visible = true; mainFrame.ZIndex = 50
+Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, 16)
+local mainStroke = Instance.new("UIStroke", mainFrame)
+mainStroke.Color = C.border; mainStroke.Thickness = 1; mainStroke.Transparency = 0.3
+
+-- =============================================
+--  TITLE BAR (gradient)
+-- =============================================
+
+local titleBar = Instance.new("Frame", mainFrame)
+titleBar.Size = UDim2.new(1,0,0,44); titleBar.BackgroundColor3 = Color3.fromRGB(22, 20, 35)
+titleBar.BorderSizePixel = 0; titleBar.ZIndex = 51
+Instance.new("UICorner", titleBar).CornerRadius = UDim.new(0, 16)
+-- Fill bottom corners
+local titleFill = Instance.new("Frame", titleBar); titleFill.Size = UDim2.new(1,0,0,16)
+titleFill.Position = UDim2.new(0,0,1,-16); titleFill.BackgroundColor3 = Color3.fromRGB(22, 20, 35)
+titleFill.BorderSizePixel = 0; titleFill.ZIndex = 51
+-- Accent line under title
+local accentLine = Instance.new("Frame", titleBar)
+accentLine.Size = UDim2.new(0.6, 0, 0, 2); accentLine.Position = UDim2.new(0.02, 0, 1, -1)
+accentLine.BackgroundColor3 = C.accent1; accentLine.BorderSizePixel = 0; accentLine.ZIndex = 52
+Instance.new("UICorner", accentLine).CornerRadius = UDim.new(1, 0)
+
+-- Title text
+local tt = Instance.new("TextLabel", titleBar); tt.Size = UDim2.new(1,-50,1,0); tt.Position = UDim2.new(0,14,0,0)
+tt.BackgroundTransparency = 1; tt.Text = "Auto Farm"; tt.TextColor3 = C.text
+tt.TextSize = 16; tt.Font = Enum.Font.GothamBold; tt.TextXAlignment = Enum.TextXAlignment.Left; tt.ZIndex = 52
+-- Version badge
+local verBadge = Instance.new("TextLabel", titleBar)
+verBadge.Size = UDim2.new(0, 22, 0, 14); verBadge.Position = UDim2.new(0, 102, 0.5, -7)
+verBadge.BackgroundColor3 = C.accent1; verBadge.BackgroundTransparency = 0.7
+verBadge.Text = "v5"; verBadge.TextColor3 = Color3.fromRGB(180, 160, 255)
+verBadge.TextSize = 9; verBadge.Font = Enum.Font.GothamBold; verBadge.BorderSizePixel = 0; verBadge.ZIndex = 53
+Instance.new("UICorner", verBadge).CornerRadius = UDim.new(0, 4)
+
+-- Close button
+local cb = Instance.new("TextButton", titleBar); cb.Size = UDim2.new(0,28,0,28); cb.Position = UDim2.new(1,-36,0,8)
+cb.BackgroundColor3 = Color3.fromRGB(60, 30, 40); cb.Text = "x"; cb.TextColor3 = C.accent4
+cb.TextSize = 14; cb.Font = Enum.Font.GothamBold; cb.BorderSizePixel = 0; cb.ZIndex = 54
+Instance.new("UICorner", cb).CornerRadius = UDim.new(0, 8)
+cb.MouseButton1Click:Connect(function()
+    State.guiVisible = false; mainFrame.Visible = false
+    floatBtn.BackgroundColor3 = C.accent3
+end)
+
+-- Drag
+local db = Instance.new("TextButton", titleBar); db.Size = UDim2.new(1,-40,1,0)
+db.BackgroundTransparency = 1; db.Text = ""; db.ZIndex = 53
+local mD = {on=false, s=nil, p=nil}
+db.InputBegan:Connect(function(i)
+    if i.UserInputType == Enum.UserInputType.Touch or i.UserInputType == Enum.UserInputType.MouseButton1 then
+        mD.on=true; mD.s=i.Position; mD.p=mainFrame.Position
+    end
+end)
+UIS.InputChanged:Connect(function(i)
+    if mD.on and (i.UserInputType == Enum.UserInputType.Touch or i.UserInputType == Enum.UserInputType.MouseMovement) then
+        local d = i.Position - mD.s
+        mainFrame.Position = UDim2.new(mD.p.X.Scale, mD.p.X.Offset+d.X, mD.p.Y.Scale, mD.p.Y.Offset+d.Y)
+    end
+end)
+UIS.InputEnded:Connect(function(i)
+    if i.UserInputType == Enum.UserInputType.Touch or i.UserInputType == Enum.UserInputType.MouseButton1 then mD.on = false end
+end)
+
+-- =============================================
+--  SCROLL AREA
+-- =============================================
+
+local sc = Instance.new("ScrollingFrame", mainFrame)
+sc.Size = UDim2.new(1,-4,1,-50); sc.Position = UDim2.new(0,2,0,48)
+sc.BackgroundTransparency = 1; sc.BorderSizePixel = 0; sc.ScrollBarThickness = 2
+sc.ScrollBarImageColor3 = C.accent1
+sc.CanvasSize = UDim2.new(0,0,0,0); sc.AutomaticCanvasSize = Enum.AutomaticSize.Y; sc.ZIndex = 51
+local scLayout = Instance.new("UIListLayout", sc)
+scLayout.Padding = UDim.new(0, 5); scLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+local pd = Instance.new("UIPadding", sc)
+pd.PaddingLeft = UDim.new(0,6); pd.PaddingRight = UDim.new(0,6)
+pd.PaddingTop = UDim.new(0,4); pd.PaddingBottom = UDim.new(0,8)
+
+-- =============================================
+--  WIDGET BUILDERS
+-- =============================================
+local lo = 0
+local function nxt() lo=lo+1; return lo end
+
+-- Section header with icon dot
+local function sec(title, color, icon)
+    local f = Instance.new("Frame", sc); f.Size = UDim2.new(1,0,0,22); f.BackgroundTransparency = 1
+    f.LayoutOrder = nxt(); f.ZIndex = 51
+    -- Dot
+    local dot = Instance.new("Frame", f); dot.Size = UDim2.new(0,6,0,6)
+    dot.Position = UDim2.new(0,2,0.5,-3); dot.BackgroundColor3 = color; dot.BorderSizePixel = 0; dot.ZIndex = 52
+    Instance.new("UICorner", dot).CornerRadius = UDim.new(1,0)
+    -- Label
+    local l = Instance.new("TextLabel", f); l.Size = UDim2.new(1,-14,1,0); l.Position = UDim2.new(0,12,0,0)
+    l.BackgroundTransparency = 1; l.Text = string.upper(title)
+    l.TextColor3 = color; l.TextSize = 9; l.Font = Enum.Font.GothamBold
+    l.TextXAlignment = Enum.TextXAlignment.Left; l.ZIndex = 52
+    -- Subtle line
+    local ln = Instance.new("Frame", f); ln.Size = UDim2.new(1,-80,0,1); ln.Position = UDim2.new(0,78,0.5,0)
+    ln.BackgroundColor3 = C.border; ln.BackgroundTransparency = 0.5; ln.BorderSizePixel = 0; ln.ZIndex = 51
+end
+
+-- Toggle with better styling
+local function tog(label, stateKey, color)
+    local h = Instance.new("Frame", sc); h.Size = UDim2.new(1,0,0,40); h.BackgroundColor3 = C.card
+    h.BorderSizePixel = 0; h.LayoutOrder = nxt(); h.ZIndex = 51
+    Instance.new("UICorner", h).CornerRadius = UDim.new(0, 10)
+    local hStroke = Instance.new("UIStroke", h)
+    hStroke.Color = C.border; hStroke.Thickness = 1; hStroke.Transparency = 0.6
+
+    local l = Instance.new("TextLabel", h); l.Size = UDim2.new(1,-60,1,0); l.Position = UDim2.new(0,12,0,0)
+    l.BackgroundTransparency = 1; l.Text = label; l.TextColor3 = C.textMid
+    l.TextSize = 12; l.Font = Enum.Font.Gotham; l.TextXAlignment = Enum.TextXAlignment.Left; l.ZIndex = 52
+
+    -- Toggle track (wider, more modern)
+    local tr = Instance.new("Frame", h); tr.Size = UDim2.new(0,42,0,24); tr.Position = UDim2.new(1,-52,0.5,-12)
+    tr.BackgroundColor3 = C.toggleOff; tr.BorderSizePixel = 0; tr.ZIndex = 52
+    Instance.new("UICorner", tr).CornerRadius = UDim.new(1, 0)
+
+    -- Knob (circle)
+    local kn = Instance.new("Frame", tr); kn.Size = UDim2.new(0,20,0,20); kn.Position = UDim2.new(0,2,0,2)
+    kn.BackgroundColor3 = Color3.fromRGB(120,120,135); kn.BorderSizePixel = 0; kn.ZIndex = 53
+    Instance.new("UICorner", kn).CornerRadius = UDim.new(1, 0)
+
+    local b = Instance.new("TextButton", h); b.Size = UDim2.new(1,0,1,0); b.BackgroundTransparency = 1; b.Text = ""; b.ZIndex = 54
+
+    local function upd()
+        local on = State[stateKey]
+        tr.BackgroundColor3 = on and color or C.toggleOff
+        kn.Position = on and UDim2.new(0,20,0,2) or UDim2.new(0,2,0,2)
+        kn.BackgroundColor3 = on and Color3.new(1,1,1) or Color3.fromRGB(120,120,135)
+        l.TextColor3 = on and C.text or C.textMid
+        hStroke.Color = on and color or C.border
+        hStroke.Transparency = on and 0.5 or 0.6
+        -- Subtle background tint when on
+        if on then
+            h.BackgroundColor3 = Color3.fromRGB(
+                math.clamp(C.card.R*255*0.85 + color.R*255*0.15, 0, 255),
+                math.clamp(C.card.G*255*0.85 + color.G*255*0.15, 0, 255),
+                math.clamp(C.card.B*255*0.85 + color.B*255*0.15, 0, 255))
+        else
+            h.BackgroundColor3 = C.card
+        end
+    end
+    b.MouseButton1Click:Connect(function() State[stateKey] = not State[stateKey]; upd() end)
+    upd()
+end
+
+-- Dropdown with accent color per option
+local function drop(label, options, default, onSelect, optColors)
+    local h = Instance.new("Frame", sc); h.Size = UDim2.new(1,0,0,52); h.BackgroundColor3 = C.card
+    h.BorderSizePixel = 0; h.LayoutOrder = nxt(); h.ClipsDescendants = true; h.ZIndex = 51
+    Instance.new("UICorner", h).CornerRadius = UDim.new(0, 10)
+    local hStroke2 = Instance.new("UIStroke", h)
+    hStroke2.Color = C.border; hStroke2.Transparency = 0.5
+
+    -- Label
+    local l = Instance.new("TextLabel", h); l.Size = UDim2.new(1,-14,0,14); l.Position = UDim2.new(0,12,0,5)
+    l.BackgroundTransparency = 1; l.Text = label; l.TextColor3 = C.textDim
+    l.TextSize = 9; l.Font = Enum.Font.GothamBold; l.TextXAlignment = Enum.TextXAlignment.Left; l.ZIndex = 52
+
+    -- Selected value container
+    local sf = Instance.new("Frame", h); sf.Size = UDim2.new(1,-16,0,26); sf.Position = UDim2.new(0,8,0,20)
+    sf.BackgroundColor3 = Color3.fromRGB(40, 40, 56); sf.BorderSizePixel = 0; sf.ZIndex = 52
+    Instance.new("UICorner", sf).CornerRadius = UDim.new(0, 7)
+
+    -- Arrow indicator
+    local arrow = Instance.new("TextLabel", sf); arrow.Size = UDim2.new(0,20,1,0); arrow.Position = UDim2.new(1,-22,0,0)
+    arrow.BackgroundTransparency = 1; arrow.Text = "v"; arrow.TextColor3 = C.textDim
+    arrow.TextSize = 10; arrow.Font = Enum.Font.GothamBold; arrow.ZIndex = 53
+
+    local st = Instance.new("TextLabel", sf); st.Size = UDim2.new(1,-28,1,0); st.Position = UDim2.new(0,10,0,0)
+    st.BackgroundTransparency = 1; st.Text = default or options[1]; st.TextColor3 = C.text
+    st.TextSize = 12; st.Font = Enum.Font.GothamBold; st.TextXAlignment = Enum.TextXAlignment.Left; st.ZIndex = 53
+
+    -- Options
+    for i, opt in ipairs(options) do
+        local ob = Instance.new("TextButton", h); ob.Size = UDim2.new(1,-16,0,34)
+        ob.Position = UDim2.new(0,8,0,52+(i-1)*36); ob.BackgroundColor3 = C.cardHi
+        ob.Text = ""; ob.BorderSizePixel = 0; ob.ZIndex = 53
+        Instance.new("UICorner", ob).CornerRadius = UDim.new(0, 8)
+
+        -- Color dot for each option
+        local oDot = Instance.new("Frame", ob); oDot.Size = UDim2.new(0,8,0,8)
+        oDot.Position = UDim2.new(0,10,0.5,-4); oDot.BorderSizePixel = 0; oDot.ZIndex = 54
+        oDot.BackgroundColor3 = (optColors and optColors[i]) or C.accent5
+        Instance.new("UICorner", oDot).CornerRadius = UDim.new(1,0)
+
+        local oLbl = Instance.new("TextLabel", ob); oLbl.Size = UDim2.new(1,-30,1,0); oLbl.Position = UDim2.new(0,24,0,0)
+        oLbl.BackgroundTransparency = 1; oLbl.Text = opt; oLbl.TextColor3 = C.text
+        oLbl.TextSize = 12; oLbl.Font = Enum.Font.Gotham; oLbl.TextXAlignment = Enum.TextXAlignment.Left; oLbl.ZIndex = 54
+
+        ob.MouseButton1Click:Connect(function()
+            st.Text = opt; h.Size = UDim2.new(1,0,0,52); arrow.Text = "v"
+            if onSelect then onSelect(i, opt) end
+        end)
+    end
+
+    -- Toggle open/close
+    local ca = Instance.new("TextButton", h); ca.Size = UDim2.new(1,0,0,50)
+    ca.BackgroundTransparency = 1; ca.Text = ""; ca.ZIndex = 54
+    ca.MouseButton1Click:Connect(function()
+        local open = h.Size.Y.Offset > 54
+        h.Size = open and UDim2.new(1,0,0,52) or UDim2.new(1,0,0,54+#options*36+4)
+        arrow.Text = open and "v" or "^"
+    end)
+end
+
+local function textBox(label, stateKey, placeholder, color)
+    local h = Instance.new("Frame", sc); h.Size = UDim2.new(1,0,0,54); h.BackgroundColor3 = C.card
+    h.BorderSizePixel = 0; h.LayoutOrder = nxt(); h.ZIndex = 51
+    Instance.new("UICorner", h).CornerRadius = UDim.new(0, 10)
+    local hStroke = Instance.new("UIStroke", h)
+    hStroke.Color = C.border; hStroke.Thickness = 1; hStroke.Transparency = 0.55
+
+    local l = Instance.new("TextLabel", h); l.Size = UDim2.new(1,-14,0,14); l.Position = UDim2.new(0,12,0,5)
+    l.BackgroundTransparency = 1; l.Text = label; l.TextColor3 = color or C.textDim
+    l.TextSize = 9; l.Font = Enum.Font.GothamBold; l.TextXAlignment = Enum.TextXAlignment.Left; l.ZIndex = 52
+
+    local b = Instance.new("TextBox", h); b.Size = UDim2.new(1,-16,0,26); b.Position = UDim2.new(0,8,0,22)
+    b.BackgroundColor3 = Color3.fromRGB(40, 40, 56); b.BorderSizePixel = 0; b.ZIndex = 52
+    b.Text = State[stateKey] or ""; b.PlaceholderText = placeholder or ""; b.ClearTextOnFocus = false
+    b.TextColor3 = C.text; b.PlaceholderColor3 = C.textDim; b.TextSize = 11; b.Font = Enum.Font.Gotham
+    b.TextXAlignment = Enum.TextXAlignment.Left
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 7)
+    b.FocusLost:Connect(function()
+        State[stateKey] = trimText(b.Text)
+        print("[AF] Updated " .. label)
+    end)
+end
+
+-- Info panel with left accent bar
+local function info(lines)
+    local totalH = 8 + #lines * 16
+    local h = Instance.new("Frame", sc); h.Size = UDim2.new(1,0,0,totalH)
+    h.BackgroundColor3 = Color3.fromRGB(22, 22, 38); h.BorderSizePixel = 0; h.LayoutOrder = nxt(); h.ZIndex = 51
+    Instance.new("UICorner", h).CornerRadius = UDim.new(0, 8)
+    -- Left accent bar
+    local bar = Instance.new("Frame", h); bar.Size = UDim2.new(0,3,0.7,0); bar.Position = UDim2.new(0,0,0.15,0)
+    bar.BackgroundColor3 = C.accent1; bar.BorderSizePixel = 0; bar.ZIndex = 52
+    Instance.new("UICorner", bar).CornerRadius = UDim.new(1,0)
+
+    for i, ln in ipairs(lines) do
+        local lb = Instance.new("TextLabel", h); lb.Size = UDim2.new(1,-18,0,14)
+        lb.Position = UDim2.new(0,12,0,3+(i-1)*16); lb.BackgroundTransparency = 1
+        lb.Text = ln.t; lb.TextColor3 = ln.c or C.textDim; lb.TextSize = 10
+        lb.Font = Enum.Font.Gotham; lb.TextXAlignment = Enum.TextXAlignment.Left; lb.TextWrapped = true; lb.ZIndex = 52
+    end
+end
+
+-- Status bar with background
+local statusHolder = Instance.new("Frame", sc)
+statusHolder.Size = UDim2.new(1,0,0,28); statusHolder.BackgroundColor3 = C.bgCard
+statusHolder.BorderSizePixel = 0; statusHolder.LayoutOrder = 999; statusHolder.ZIndex = 51
+Instance.new("UICorner", statusHolder).CornerRadius = UDim.new(0, 8)
+local statusDot = Instance.new("Frame", statusHolder)
+statusDot.Size = UDim2.new(0,6,0,6); statusDot.Position = UDim2.new(0,10,0.5,-3)
+statusDot.BackgroundColor3 = C.textDim; statusDot.BorderSizePixel = 0; statusDot.ZIndex = 52
+Instance.new("UICorner", statusDot).CornerRadius = UDim.new(1,0)
+local statusBar = Instance.new("TextLabel", statusHolder)
+statusBar.Size = UDim2.new(1,-24,1,0); statusBar.Position = UDim2.new(0,22,0,0)
+statusBar.BackgroundTransparency = 1
+statusBar.Text = "Idle"; statusBar.TextColor3 = C.textDim
+statusBar.TextSize = 10; statusBar.Font = Enum.Font.Gotham
+statusBar.TextXAlignment = Enum.TextXAlignment.Left; statusBar.ZIndex = 52
+
+-- =============================================
+--  LAYOUT
+-- =============================================
+
+sec("Combat", C.accent5)
+tog("Auto equip weapon", "autoEquipWeapon", C.accent5)
+tog("Auto use weapon", "autoUseWeapon", C.accent5)
+tog("Auto claim achievement", "autoClaimAchievement", C.accent5)
+
+sec("Raid Selection", C.accent4)
+
+local raidNames = {}
+for _, r in ipairs(RaidList) do table.insert(raidNames, r.display) end
+drop("Select raid", raidNames, RaidList[1].display, function(idx)
+    State.selectedRaid = RaidList[idx]
+    print("[AF] Selected: " .. State.selectedRaid.display .. " (" .. State.selectedRaid.name .. ")")
+end, {C.accent3, C.accent1})  -- amber dot for Sunshine, purple for Dark Matter
+
+info({
+    {t = "Sunshine Lake — boss raid, auto leave", c = C.accent3},
+    {t = "Dark Matter — invasion, auto replay", c = C.accent1},
+    {t = "Remotes loaded: " .. rc, c = C.green},
+})
+
+sec("Webhook", C.accent2)
+tog("Webhook enabled", "webhookEnabled", C.accent2)
+textBox("Webhook URL", "webhookUrl", "https://discord.com/api/webhooks/...", C.accent2)
+tog("Include rewards", "webhookRewards", C.accent3)
+
+sec("Modifier Priority", C.accent1)
+for i = 1, 5 do
+    local default = State.modifierPriorities[i] or ModifierOptions[1]
+    drop("Priority " .. i, ModifierOptions, default, function(_, opt)
+        State.modifierPriorities[i] = opt
+        print("[AF] Modifier priority " .. i .. ": " .. opt)
+    end, {C.textDim, C.accent4, C.accent3, C.accent1, C.accent2, C.accent5})
+end
+info({
+    {t = "Priority 1 is picked first when visible", c = C.accent1},
+    {t = "Add missing modifier names to ModifierOptions", c = C.textMid},
+})
+
+sec("Farm Controls", C.green)
+tog("Auto farm", "autoFarm", C.green)
+tog("Friend only", "friendOnly", C.accent3)
+tog("Auto create raid", "autoCreateRaid", C.accent2)
+
+sec("Warriors", C.accent2)
+tog("Auto equip best", "autoEquipBestPet", C.accent2)
+
+-- =============================================
+--  START LOOPS
+-- =============================================
+
+task.spawn(farmLoop)
+task.spawn(raidCycleLoop)
+task.spawn(victoryLoop)
+task.spawn(utilityLoop)
+
+-- Status updater
+task.spawn(function()
+    while State.running do
+        task.wait(1)
+        if State.autoFarm then
+            local enemies = getAliveEnemies()
+            local inRaid = isInRaidArea()
+
+            if inRaid then
+                if #enemies > 0 then
+                    statusBar.Text = "Killing " .. #enemies .. " enemies"
+                    statusBar.TextColor3 = C.accent4
+                    statusDot.BackgroundColor3 = C.accent4
+                else
+                    statusBar.Text = "Boss phase — swinging"
+                    statusBar.TextColor3 = C.accent1
+                    statusDot.BackgroundColor3 = C.accent1
+                end
+            else
+                if State.autoCreateRaid then
+                    statusBar.Text = "Lobby — creating " .. State.selectedRaid.display
+                    statusBar.TextColor3 = C.accent2
+                    statusDot.BackgroundColor3 = C.accent2
+                else
+                    statusBar.Text = "Lobby — waiting"
+                    statusBar.TextColor3 = C.textDim
+                    statusDot.BackgroundColor3 = C.textDim
+                end
+            end
+        else
+            statusBar.Text = "Idle — turn on Auto Farm"
+            statusBar.TextColor3 = C.textDim
+            statusDot.BackgroundColor3 = C.textDim
+        end
+    end
+end)
+
+player.CharacterAdded:Connect(function()
+    task.wait(2)
+    if State.autoEquipWeapon then equipWeapon() end
+    if State.autoEquipBestPet then equipBestWarriors() end
+end)
+
+print("===========================================")
+print("  Auto Farm v5 loaded!")
+print("  Sunshine Lake: bossRaid (leaveRaid)")
+print("  Dark Matter: invasion (replay)")
+print("  Universal enemy detection")
+print("  Priority modifier voting for invasions")
+print("  Discord webhook notifications")
+print("===========================================")
