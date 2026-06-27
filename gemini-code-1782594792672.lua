@@ -1,5 +1,5 @@
 -- =============================================
---  AUTO FARM GUI v6 — SUNSHINE + DARK MATTER
+--  AUTO FARM GUI v7 — SUNSHINE + DARK MATTER
 --  Supports both bossRaids and invasions
 -- =============================================
 
@@ -84,6 +84,7 @@ local RaidList = {
 
 local INVASION_HOLD_POS = CFrame.new(4911, 6020, 161)
 local INVASION_START_TIMEOUT = 20
+local INVASION_VICTORY_NO_MOVE = 10
 
 local ModifierOptions = {
     "Disabled",
@@ -117,6 +118,7 @@ getgenv().AFState = {
     replayGraceUntil     = 0,
     invasionStartAt      = 0,
     lastModifierVoteAt   = 0,
+    noForceMoveUntil     = 0,
     modifierPriorities   = {
         "Boss Killer",
         "Overflowing Wealth",
@@ -231,7 +233,7 @@ local function sendWebhook(title, description, color)
                 { name = "Raid", value = State.selectedRaid and State.selectedRaid.display or "Unknown", inline = true },
                 { name = "Player", value = player.Name, inline = true },
             },
-            footer = { text = "Auto Farm v6" },
+            footer = { text = "Auto Farm v7" },
             timestamp = DateTime.now():ToIsoDate(),
         }}
     }
@@ -299,7 +301,18 @@ end
 --  COMBAT
 -- =============================================
 
+local function forceMoveBlocked()
+    return State.selectedRaid and State.selectedRaid.raidType == "invasion" and tick() < (State.noForceMoveUntil or 0)
+end
+
+local function waitForForceMoveWindow()
+    while State.running and forceMoveBlocked() do
+        task.wait(0.25)
+    end
+end
+
 local function teleportTo(targetHRP)
+    if forceMoveBlocked() then return end
     local _, hrp = getChar()
     if not hrp or not targetHRP then return end
     hrp.CFrame = targetHRP.CFrame * CFrame.new(0, 0, 5)
@@ -344,6 +357,7 @@ local function isSelectedInvasion()
 end
 
 local function moveToInvasionHold(reason)
+    if forceMoveBlocked() then return false end
     if not isSelectedInvasion() or not isInRaidArea() then return false end
     local _, hrp = getChar()
     if not hrp then return false end
@@ -735,7 +749,7 @@ local function farmLoop()
             -- No enemies alive = between waves or boss dead
             -- Teleport to boss area and swing (catches spawning enemies)
             local bossPos = State.selectedRaid.bossPos
-            if bossPos then
+            if bossPos and not forceMoveBlocked() then
                 local _, hrp = getChar()
                 if hrp then
                     local dist = (hrp.Position - bossPos.Position).Magnitude
@@ -958,6 +972,10 @@ local function victoryLoop()
 
         if foundVictory then
             print("[AF] Victory detected!")
+            if State.selectedRaid.raidType == "invasion" then
+                State.noForceMoveUntil = tick() + INVASION_VICTORY_NO_MOVE
+                print("[AF] No forced movement for 10 seconds after invasion victory")
+            end
             task.wait(3)
 
             local raid = State.selectedRaid
@@ -991,7 +1009,6 @@ local function victoryLoop()
                     waitedForReplay = waitedForReplay + 0.5
                     if isInRaidArea() then
                         State.invasionStartAt = 0
-                        moveToInvasionHold("replay")
                         break
                     end
                 end
@@ -1001,6 +1018,8 @@ local function victoryLoop()
                     State.replayGraceUntil = 0
                     print("[AF] Invasion replay did not start in 20 seconds; will return to bald hero.")
                 else
+                    waitForForceMoveWindow()
+                    moveToInvasionHold("replay")
                     print("[AF] Replaying invasion, staying inside raid.")
                 end
 
@@ -1173,7 +1192,7 @@ tt.TextSize = 16; tt.Font = Enum.Font.GothamBold; tt.TextXAlignment = Enum.TextX
 local verBadge = Instance.new("TextLabel", titleBar)
 verBadge.Size = UDim2.new(0, 22, 0, 14); verBadge.Position = UDim2.new(0, 102, 0.5, -7)
 verBadge.BackgroundColor3 = C.accent1; verBadge.BackgroundTransparency = 0.7
-verBadge.Text = "v6"; verBadge.TextColor3 = Color3.fromRGB(180, 160, 255)
+verBadge.Text = "v7"; verBadge.TextColor3 = Color3.fromRGB(180, 160, 255)
 verBadge.TextSize = 9; verBadge.Font = Enum.Font.GothamBold; verBadge.BorderSizePixel = 0; verBadge.ZIndex = 53
 Instance.new("UICorner", verBadge).CornerRadius = UDim.new(0, 4)
 
@@ -1514,11 +1533,12 @@ player.CharacterAdded:Connect(function()
 end)
 
 print("===========================================")
-print("  Auto Farm v6 loaded!")
+print("  Auto Farm v7 loaded!")
 print("  Sunshine Lake: bossRaid (leaveRaid)")
 print("  Dark Matter: invasion (replay)")
 print("  Universal enemy detection")
 print("  Priority modifier voting toggle for invasions")
 print("  Invasion replay hold position: 4911, 6020, 161")
+print("  No forced movement for 10s after invasion victory")
 print("  Discord webhook notifications")
 print("===========================================")
