@@ -1,5 +1,5 @@
 -- =============================================
---  AUTO FARM GUI v8 — SUNSHINE + DARK MATTER
+--  AUTO FARM GUI v9 — SUNSHINE + DARK MATTER
 --  Supports both bossRaids and invasions
 -- =============================================
 
@@ -83,7 +83,6 @@ local RaidList = {
 
 local INVASION_HOLD_POS = CFrame.new(4911, 6020, 161)
 local INVASION_START_TIMEOUT = 20
-local INVASION_VICTORY_NO_MOVE = 10
 
 local ModifierOptions = {
     "Disabled",
@@ -116,7 +115,8 @@ getgenv().AFState = {
     autoPickModifiers    = false,
     invasionStartAt      = 0,
     lastModifierVoteAt   = 0,
-    noForceMoveUntil     = 0,
+    lastModifierSignature = "",
+    modifierPickedForSignature = false,
     modifierPriorities   = {
         "Boss Killer",
         "Overflowing Wealth",
@@ -231,7 +231,7 @@ local function sendWebhook(title, description, color)
                 { name = "Raid", value = State.selectedRaid and State.selectedRaid.display or "Unknown", inline = true },
                 { name = "Player", value = player.Name, inline = true },
             },
-            footer = { text = "Auto Farm v8" },
+            footer = { text = "Auto Farm v9" },
             timestamp = DateTime.now():ToIsoDate(),
         }}
     }
@@ -299,18 +299,7 @@ end
 --  COMBAT
 -- =============================================
 
-local function forceMoveBlocked()
-    return State.selectedRaid and State.selectedRaid.raidType == "invasion" and tick() < (State.noForceMoveUntil or 0)
-end
-
-local function waitForForceMoveWindow()
-    while State.running and forceMoveBlocked() do
-        task.wait(0.25)
-    end
-end
-
 local function teleportTo(targetHRP)
-    if forceMoveBlocked() then return end
     local _, hrp = getChar()
     if not hrp or not targetHRP then return end
     hrp.CFrame = targetHRP.CFrame * CFrame.new(0, 0, 5)
@@ -355,7 +344,6 @@ local function isSelectedInvasion()
 end
 
 local function moveToInvasionHold(reason)
-    if forceMoveBlocked() then return false end
     if not isSelectedInvasion() or not isInRaidArea() then return false end
     local _, hrp = getChar()
     if not hrp then return false end
@@ -484,11 +472,6 @@ local function createRaid()
     -- Try clicking the start button in game UI
     print("[AF] Looking for " .. raid.startText .. " button...")
 
-    -- For Dark Matter: first click "lead me to the invasion" if talking to NPC
-    if raid.raidType == "invasion" then
-        clickByText("lead me to the invasion")
-        task.wait(1)
-    end
 
     if clickByText(raid.startText) then
         task.wait(1.5)
@@ -592,6 +575,20 @@ local function clickDialog(searchText)
                 end
             end
         end
+    end
+    return false
+end
+
+
+local function clickLeadToInvasion()
+    local clicked = false
+    for attempt = 1, 8 do
+        clicked = clickDialog("lead me") or clickByText("lead me to the invasion") or clickByText("lead me")
+        if clicked then
+            print("[AF] Clicked Lead me to the invasion")
+            return true
+        end
+        task.wait(0.35)
     end
     return false
 end
@@ -713,11 +710,30 @@ local function getVisibleModifierCards()
     return cards
 end
 
+local function getModifierSignature(cards)
+    local parts = {}
+    for _, card in ipairs(cards) do
+        table.insert(parts, card.title .. ":" .. tostring(card.tier))
+    end
+    table.sort(parts)
+    return table.concat(parts, "|")
+end
+
 local function autoVoteCard()
     if not State.autoPickModifiers then return false end
-    if tick() - (State.lastModifierVoteAt or 0) < 2 then return false end
     local cards = getVisibleModifierCards()
-    if #cards == 0 then return false end
+    if #cards == 0 then
+        State.lastModifierSignature = ""
+        State.modifierPickedForSignature = false
+        return false
+    end
+
+    local signature = getModifierSignature(cards)
+    if signature ~= State.lastModifierSignature then
+        State.lastModifierSignature = signature
+        State.modifierPickedForSignature = false
+    end
+    if State.modifierPickedForSignature then return false end
 
     for _, wanted in ipairs(State.modifierPriorities or {}) do
         wanted = trimText(wanted)
@@ -736,6 +752,7 @@ local function autoVoteCard()
             for _, card in ipairs(matches) do
                 if clickCardFromLabel(card.label, card.title, card.index) then
                     State.lastModifierVoteAt = tick()
+                    State.modifierPickedForSignature = true
                     print("[AF] Voted priority modifier: " .. card.title .. " (tier " .. tostring(card.tier) .. ")")
                     sendWebhook("Modifier picked", "Picked **" .. card.title .. "** from priority list.", 3447003)
                     return true
@@ -746,6 +763,7 @@ local function autoVoteCard()
 
     if clickCardFromLabel(cards[1].label, cards[1].title, cards[1].index) then
         State.lastModifierVoteAt = tick()
+        State.modifierPickedForSignature = true
         print("[AF] Voted fallback modifier: " .. cards[1].title)
         sendWebhook("Modifier picked", "Picked fallback **" .. cards[1].title .. "** because no priority cards were visible.", 15105570)
         return true
@@ -781,7 +799,7 @@ local function farmLoop()
             -- No enemies alive = between waves or boss dead
             -- Teleport to boss area and swing (catches spawning enemies)
             local bossPos = State.selectedRaid.bossPos
-            if bossPos and not forceMoveBlocked() then
+            if bossPos then
                 local _, hrp = getChar()
                 if hrp then
                     local dist = (hrp.Position - bossPos.Position).Magnitude
@@ -840,8 +858,9 @@ local function raidCycleLoop()
                 end
 
                 if raid.raidType == "invasion" then
-                    -- Step 1: Press E ONCE (small radius to avoid wrong NPC)
+                    -- Step 1: Press E near the NPC, then use GUI fallback if the prompt UI is present.
                     local _, myHRP = getChar()
+                    local pressedPrompt = false
                     if myHRP then
                         for _, desc in ipairs(Workspace:GetDescendants()) do
                             if desc:IsA("ProximityPrompt") then
@@ -850,6 +869,7 @@ local function raidCycleLoop()
                                     local dist = (myHRP.Position - part.Position).Magnitude
                                     if dist < 10 then
                                         pcall(function() fireproximityprompt(desc) end)
+                                        pressedPrompt = true
                                         print("[AF] Pressed E (dist=" .. math.floor(dist) .. ")")
                                         break
                                     end
@@ -857,6 +877,7 @@ local function raidCycleLoop()
                             end
                         end
                     end
+                    if not pressedPrompt then pressE() end
 
                     -- Step 2: Wait up to 5s for dialog, do NOT press E again
                     local foundLead = false
@@ -876,8 +897,10 @@ local function raidCycleLoop()
                     -- Step 3: Click "Lead me to the invasion"
                     if foundLead then
                         task.wait(0.3)
-                        clickByText("lead me to the invasion")
-                        print("[AF] Clicked Lead me!")
+                        if not clickLeadToInvasion() then
+                            print("[AF] Lead me button was visible but click failed, retrying...")
+                            continue
+                        end
                         task.wait(2)
                     else
                         print("[AF] Dialog didn't appear, retrying...")
@@ -1002,10 +1025,6 @@ local function victoryLoop()
 
         if foundVictory then
             print("[AF] Victory detected!")
-            if State.selectedRaid.raidType == "invasion" then
-                State.noForceMoveUntil = tick() + INVASION_VICTORY_NO_MOVE
-                print("[AF] No forced movement for 10 seconds after invasion victory")
-            end
             task.wait(3)
 
             local raid = State.selectedRaid
@@ -1030,7 +1049,8 @@ local function victoryLoop()
                 task.wait(2)
                 State.inRaid = false
                 State.invasionStartAt = 0
-                State.noForceMoveUntil = 0
+                State.lastModifierSignature = ""
+                State.modifierPickedForSignature = false
                 print("[AF] Invasion continued; returning to bald hero for fresh start.")
 
             else
@@ -1198,7 +1218,7 @@ tt.TextSize = 16; tt.Font = Enum.Font.GothamBold; tt.TextXAlignment = Enum.TextX
 local verBadge = Instance.new("TextLabel", titleBar)
 verBadge.Size = UDim2.new(0, 22, 0, 14); verBadge.Position = UDim2.new(0, 102, 0.5, -7)
 verBadge.BackgroundColor3 = C.accent1; verBadge.BackgroundTransparency = 0.7
-verBadge.Text = "v8"; verBadge.TextColor3 = Color3.fromRGB(180, 160, 255)
+verBadge.Text = "v9"; verBadge.TextColor3 = Color3.fromRGB(180, 160, 255)
 verBadge.TextSize = 9; verBadge.Font = Enum.Font.GothamBold; verBadge.BorderSizePixel = 0; verBadge.ZIndex = 53
 Instance.new("UICorner", verBadge).CornerRadius = UDim.new(0, 4)
 
@@ -1539,11 +1559,12 @@ player.CharacterAdded:Connect(function()
 end)
 
 print("===========================================")
-print("  Auto Farm v8 loaded!")
+print("  Auto Farm v9 loaded!")
 print("  Sunshine Lake: bossRaid (leaveRaid)")
 print("  Dark Matter: invasion (continue + restart)")
 print("  Universal enemy detection")
-print("  Priority modifier voting with tier sorting")
+print("  Priority modifier voting once per card set")
 print("  Invasion restart uses Continue, no Replay remote")
+print("  Lead me dialog click retry improved")
 print("  Discord webhook notifications")
 print("===========================================")
