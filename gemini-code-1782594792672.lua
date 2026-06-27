@@ -1,5 +1,5 @@
 -- =============================================
---  AUTO FARM GUI v7 — SUNSHINE + DARK MATTER
+--  AUTO FARM GUI v8 — SUNSHINE + DARK MATTER
 --  Supports both bossRaids and invasions
 -- =============================================
 
@@ -40,7 +40,6 @@ local R = {
     leaveRaid       = getRemote("bossRaids", "leaveRaid"),
     -- Invasions (Dark Matter)
     createInvasion  = getRemote("invasions", "create"),
-    replayInvasion  = getRemote("invasions", "replay"),
     voteCard        = getRemote("invasions", "voteCard"),
     -- Shared
     lobbyStart      = getRemote("lobbies", "start"),
@@ -115,7 +114,6 @@ getgenv().AFState = {
     webhookUrl           = "",
     webhookRewards       = true,
     autoPickModifiers    = false,
-    replayGraceUntil     = 0,
     invasionStartAt      = 0,
     lastModifierVoteAt   = 0,
     noForceMoveUntil     = 0,
@@ -233,7 +231,7 @@ local function sendWebhook(title, description, color)
                 { name = "Raid", value = State.selectedRaid and State.selectedRaid.display or "Unknown", inline = true },
                 { name = "Player", value = player.Name, inline = true },
             },
-            footer = { text = "Auto Farm v7" },
+            footer = { text = "Auto Farm v8" },
             timestamp = DateTime.now():ToIsoDate(),
         }}
     }
@@ -448,7 +446,7 @@ local function clickByText(searchText)
     return false
 end
 
--- Click exact text match (for Continue/Replay)
+-- Click exact text match (for Continue)
 local function clickExact(exactText)
     for _, obj in ipairs(pgui:GetDescendants()) do
         if obj:IsA("TextLabel") and obj.Visible and obj.Text == exactText then
@@ -542,13 +540,6 @@ local function leaveRaid()
     if R.leaveRaid then
         pcall(function() R.leaveRaid:FireServer() end)
         print("[AF] Left raid")
-    end
-end
-
-local function replayInvasion()
-    if R.replayInvasion then
-        pcall(function() R.replayInvasion:InvokeServer() end)
-        print("[AF] Replay invasion!")
     end
 end
 
@@ -667,6 +658,36 @@ local function clickCardFromLabel(label, title, index)
     return false
 end
 
+local function modifierKeysMatch(cardKey, wantedKey)
+    if string.find(cardKey, wantedKey, 1, true) or string.find(wantedKey, cardKey, 1, true) then return true end
+    if string.find(cardKey, "overflowing", 1, true) and string.find(wantedKey, "overflowing", 1, true) then return true end
+    if string.find(cardKey, "boss killer", 1, true) and string.find(wantedKey, "boss killer", 1, true) then return true end
+    return false
+end
+
+local function isKnownModifierText(low)
+    if string.find(low, "overflowing", 1, true) or string.find(low, "boss killer", 1, true) then return true end
+    for _, opt in ipairs(ModifierOptions) do
+        if opt ~= "Disabled" and string.find(low, normalizeText(opt), 1, true) then return true end
+    end
+    return false
+end
+
+local function getModifierTier(text)
+    local low = normalizeText(text)
+    local digitTier = low:match("(%d+)%s*$")
+    if digitTier then return tonumber(digitTier) or 1 end
+
+    local suffix = low:match("([il]+)%s*$")
+    if suffix then return #suffix end
+
+    suffix = low:match("([ivx]+)%s*$")
+    if suffix == "iii" then return 3 end
+    if suffix == "ii" then return 2 end
+    if suffix == "i" then return 1 end
+    return 1
+end
+
 local function getVisibleModifierCards()
     local cards = {}
     local seen = {}
@@ -674,14 +695,17 @@ local function getVisibleModifierCards()
         if obj:IsA("TextLabel") and obj.Visible then
             if obj:IsDescendantOf(pgui:FindFirstChild("AutoFarmGUI")) then continue end
             local text = trimText(obj.Text)
-            if text ~= "" and #text <= 45 and not seen[text] then
+            if text ~= "" and #text <= 55 and not seen[text] then
                 local low = normalizeText(text)
-                for _, opt in ipairs(ModifierOptions) do
-                    if opt ~= "Disabled" and string.find(low, normalizeText(opt), 1, true) then
-                        seen[text] = true
-                        table.insert(cards, { label = obj, title = text, key = low, index = #cards + 1 })
-                        break
-                    end
+                if isKnownModifierText(low) then
+                    seen[text] = true
+                    table.insert(cards, {
+                        label = obj,
+                        title = text,
+                        key = low,
+                        tier = getModifierTier(text),
+                        index = #cards + 1,
+                    })
                 end
             end
         end
@@ -699,14 +723,22 @@ local function autoVoteCard()
         wanted = trimText(wanted)
         if wanted ~= "" and wanted ~= "Disabled" then
             local wantedKey = normalizeText(wanted)
+            local matches = {}
             for _, card in ipairs(cards) do
-                if string.find(card.key, wantedKey, 1, true) or string.find(wantedKey, card.key, 1, true) then
-                    if clickCardFromLabel(card.label, card.title, card.index) then
-                        State.lastModifierVoteAt = tick()
-                        print("[AF] Voted priority modifier: " .. card.title)
-                        sendWebhook("Modifier picked", "Picked **" .. card.title .. "** from priority list.", 3447003)
-                        return true
-                    end
+                if modifierKeysMatch(card.key, wantedKey) then
+                    table.insert(matches, card)
+                end
+            end
+            table.sort(matches, function(a, b)
+                if a.tier == b.tier then return a.index < b.index end
+                return a.tier > b.tier
+            end)
+            for _, card in ipairs(matches) do
+                if clickCardFromLabel(card.label, card.title, card.index) then
+                    State.lastModifierVoteAt = tick()
+                    print("[AF] Voted priority modifier: " .. card.title .. " (tier " .. tostring(card.tier) .. ")")
+                    sendWebhook("Modifier picked", "Picked **" .. card.title .. "** from priority list.", 3447003)
+                    return true
                 end
             end
         end
@@ -776,13 +808,12 @@ local function raidCycleLoop()
         if not State.autoFarm or not State.autoCreateRaid then continue end
         if not State.selectedRaid.working then continue end
 
-        local waitingForInvasionReplay = isSelectedInvasion() and tick() < (State.replayGraceUntil or 0) and not invasionStartTimedOut()
         if isSelectedInvasion() and isInRaidArea() then
             State.inRaid = true
             State.invasionStartAt = 0
         end
 
-        if not isInRaidArea() and not State.inRaid and not waitingForInvasionReplay then
+        if not isInRaidArea() and not State.inRaid then
             local enemies = getAliveEnemies()
             if #enemies == 0 then
                 local raid = State.selectedRaid
@@ -932,7 +963,6 @@ local function raidCycleLoop()
                 else
                     if raid.raidType == "invasion" then
                         State.inRaid = false
-                        State.replayGraceUntil = 0
                         print("[AF] Invasion did not start in 20 seconds; retrying from bald hero...")
                     else
                         print("[AF] Failed to enter raid, retrying...")
@@ -982,46 +1012,26 @@ local function victoryLoop()
             local rewardText = State.webhookRewards and getVictoryRewards() or "Completed."
 
             if raid.raidType == "invasion" then
-                -- INVASION: Click Replay to restart immediately
-                print("[AF] Clicking Replay...")
-                local replayed = false
+                -- INVASION: Click Continue, then let the normal cycle go back to bald hero and restart.
+                print("[AF] Clicking Continue after invasion...")
+                local continued = false
                 for attempt = 1, 5 do
-                    if clickExact("Replay") then
-                        replayed = true
+                    if clickExact("Continue") then
+                        continued = true
                         break
                     end
                     task.wait(1)
                 end
-
-                -- Also fire remote directly as backup
-                if not replayed then
-                    replayInvasion()
+                if not continued then
+                    clickByText("continue")
                 end
 
-                State.inRaid = true
-                State.invasionStartAt = tick()
-                State.replayGraceUntil = tick() + INVASION_START_TIMEOUT
                 sendWebhook("Invasion finished", rewardText, 5763719)
-
-                local waitedForReplay = 0
-                while State.running and waitedForReplay < INVASION_START_TIMEOUT do
-                    task.wait(0.5)
-                    waitedForReplay = waitedForReplay + 0.5
-                    if isInRaidArea() then
-                        State.invasionStartAt = 0
-                        break
-                    end
-                end
-
-                if not isInRaidArea() then
-                    State.inRaid = false
-                    State.replayGraceUntil = 0
-                    print("[AF] Invasion replay did not start in 20 seconds; will return to bald hero.")
-                else
-                    waitForForceMoveWindow()
-                    moveToInvasionHold("replay")
-                    print("[AF] Replaying invasion, staying inside raid.")
-                end
+                task.wait(2)
+                State.inRaid = false
+                State.invasionStartAt = 0
+                State.noForceMoveUntil = 0
+                print("[AF] Invasion continued; returning to bald hero for fresh start.")
 
             else
                 -- BOSS RAID: Click Continue then leaveRaid
@@ -1047,12 +1057,8 @@ local function victoryLoop()
 
         -- Backup: detect teleport back to lobby
         if State.inRaid and not isInRaidArea() then
-            if State.selectedRaid.raidType == "invasion" and tick() < (State.replayGraceUntil or 0) and not invasionStartTimedOut() then
-                print("[AF] Invasion replay transition detected; staying in raid mode")
-            else
-                print("[AF] Returned to lobby (teleport detected)")
-                State.inRaid = false
-            end
+            print("[AF] Returned to lobby (teleport detected)")
+            State.inRaid = false
         end
     end
 end
@@ -1192,7 +1198,7 @@ tt.TextSize = 16; tt.Font = Enum.Font.GothamBold; tt.TextXAlignment = Enum.TextX
 local verBadge = Instance.new("TextLabel", titleBar)
 verBadge.Size = UDim2.new(0, 22, 0, 14); verBadge.Position = UDim2.new(0, 102, 0.5, -7)
 verBadge.BackgroundColor3 = C.accent1; verBadge.BackgroundTransparency = 0.7
-verBadge.Text = "v7"; verBadge.TextColor3 = Color3.fromRGB(180, 160, 255)
+verBadge.Text = "v8"; verBadge.TextColor3 = Color3.fromRGB(180, 160, 255)
 verBadge.TextSize = 9; verBadge.Font = Enum.Font.GothamBold; verBadge.BorderSizePixel = 0; verBadge.ZIndex = 53
 Instance.new("UICorner", verBadge).CornerRadius = UDim.new(0, 4)
 
@@ -1448,7 +1454,7 @@ end, {C.accent3, C.accent1})  -- amber dot for Sunshine, purple for Dark Matter
 
 info({
     {t = "Sunshine Lake — boss raid, auto leave", c = C.accent3},
-    {t = "Dark Matter — invasion, auto replay", c = C.accent1},
+    {t = "Dark Matter — invasion, continue + restart", c = C.accent1},
     {t = "Remotes loaded: " .. rc, c = C.green},
 })
 
@@ -1533,12 +1539,11 @@ player.CharacterAdded:Connect(function()
 end)
 
 print("===========================================")
-print("  Auto Farm v7 loaded!")
+print("  Auto Farm v8 loaded!")
 print("  Sunshine Lake: bossRaid (leaveRaid)")
-print("  Dark Matter: invasion (replay)")
+print("  Dark Matter: invasion (continue + restart)")
 print("  Universal enemy detection")
-print("  Priority modifier voting toggle for invasions")
-print("  Invasion replay hold position: 4911, 6020, 161")
-print("  No forced movement for 10s after invasion victory")
+print("  Priority modifier voting with tier sorting")
+print("  Invasion restart uses Continue, no Replay remote")
 print("  Discord webhook notifications")
 print("===========================================")
